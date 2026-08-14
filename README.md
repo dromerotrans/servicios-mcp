@@ -1,14 +1,18 @@
-# hermes-mcp
+# servicios-mcp
 
-Servidor MCP remoto (Streamable HTTP), de **solo lectura**, que expone la API
-de SAP Business One Service Layer y la API de contratos de servicio de Cisco
-(CCWR) usadas por el proyecto Hermes de Trans Industrias Electrónicas.
+Servidor MCP remoto (Streamable HTTP), de **SOLO CONSULTA** (nunca escribe
+ni modifica nada en SAP ni en Cisco), que expone la API de SAP Business One
+Service Layer y la API de contratos de servicio de Cisco (CCWR) usadas por
+el proyecto Hermes de Trans Industrias Electrónicas.
 
 Pensado para que un cliente externo (otro Claude, en otra cuenta) pueda
 agregarlo como conector MCP remoto y consultar los mismos datos sin acceso
 directo al clúster ni a las credenciales reales de SAP/Cisco.
 
 ## Tools expuestas
+
+**Las tres tools son exclusivamente de lectura — no existe en este código
+ninguna tool que pueda crear, modificar o borrar nada en SAP ni en CCWR.**
 
 - `sap_query(entity, select, filter, orderby, top, skip)` — `GET` genérico
   contra una colección OData de SAP B1 Service Layer (`Orders`,
@@ -20,10 +24,11 @@ directo al clúster ni a las credenciales reales de SAP/Cisco.
 - `ccwr_search(serial_numbers, contract_numbers, instance_numbers, limit, offset)`
   — búsqueda de contratos de servicio de Cisco.
 
-**Regla no negociable, heredada del skill `sap-service-layer` de Hermes:**
-el servidor nunca arma un `POST`/`PATCH`/`DELETE` contra una entidad de
-datos de SAP. Las únicas llamadas POST son `Login`/`Logout` de sesión SAP
-y el token endpoint OAuth2 de Cisco.
+**Regla no negociable, heredada de los skills `sap-service-layer` y
+`ccwr-contract-admin` de Hermes:** el servidor nunca arma un
+`POST`/`PATCH`/`DELETE` contra una entidad de datos de SAP o de CCWR. Las
+únicas llamadas POST del código son `Login`/`Logout` de sesión SAP y el
+token endpoint OAuth2 de Cisco — ambas de autenticación, ninguna de datos.
 
 ## Autenticación
 
@@ -61,8 +66,9 @@ Healthcheck sin auth: `GET /healthz`. Endpoint MCP: `POST /mcp`.
 
 ## Despliegue
 
-Pensado para correr como Deployment propio en OKD (namespace `hermes`),
-detrás de una Route pública con TLS, mismo patrón que el resto de los
-componentes de Hermes en este proyecto (`hermes-agent`, `honcho-api`,
-`trilium`). Ver el changelog del proyecto Hermes (doc interno, no en este
-repo) para el detalle de despliegue real.
+Corre como Deployment propio en OKD (namespace `hermes`, componente
+`servicios-mcp` — renombrado desde `hermes-mcp` el 2026-08-14), detrás de
+una Route pública (`servicios-mcp.trans.com.ar`) con TLS real, mismo patrón
+que el resto de los componentes de Hermes en este proyecto (`hermes-agent`,
+`honcho-api`, `trilium`). Ver el changelog del proyecto Hermes (doc
+interno, no en este repo) para el detalle de despliegue real.
