@@ -1,7 +1,8 @@
 """
-hermes-mcp — servidor MCP remoto (Streamable HTTP) que expone, de solo
-lectura, la API de SAP Business One Service Layer y la API de contratos
-de Cisco (CCWR) usadas por Hermes.
+servicios-mcp — servidor MCP remoto (Streamable HTTP) que expone, de solo
+lectura, la API de SAP Business One Service Layer, la API de contratos
+de Cisco (CCWR) y la API de estado de órdenes de Cisco (CCW) usadas por
+Hermes.
 
 Diseñado para correr como un Deployment propio en el namespace `hermes`
 de OKD, detrás de una Route pública con TLS, para que un cliente externo
@@ -61,6 +62,14 @@ CCWR_API_URL = os.environ.get(
 )
 CCWR_CLIENT_ID = os.environ.get("CCWR_CLIENT_ID", "")
 CCWR_CLIENT_SECRET = os.environ.get("CCWR_CLIENT_SECRET", "")
+
+# CCW — Cisco B2B Commerce GraphQL API (estado de órdenes de compra Cisco).
+# Distinto de CCWR (contratos de servicio) — API y credenciales separadas,
+# mismo token endpoint de Cisco. Ver deploy/skill-order-status-modern-graphql-2026-08-06.md.
+CCW_TOKEN_URL = os.environ.get("CCW_TOKEN_URL", "https://id.cisco.com/oauth2/default/v1/token")
+CCW_API_URL = os.environ.get("CCW_API_URL", "https://capi.cisco.com/commerce/apis")
+CCW_CLIENT_ID = os.environ.get("CCW_CLIENT_ID", "")
+CCW_CLIENT_SECRET = os.environ.get("CCW_CLIENT_SECRET", "")
 
 # "token1:etiqueta1,token2:etiqueta2" -> {"token1": "etiqueta1", ...}
 _raw_tokens = os.environ.get("MCP_ACCESS_TOKENS", "")
@@ -244,8 +253,82 @@ class CcwrClient:
             raise RuntimeError(f"CCWR HTTP {e.code}: {body_txt[:500]}") from e
 
 
+# ---------------------------------------------------------------------------
+# Cliente Cisco CCW — Commerce GraphQL, OAuth2 client_credentials, token cacheado
+# ---------------------------------------------------------------------------
+
+
+class CcwClient:
+    def __init__(self) -> None:
+        self._token: str | None = None
+        self._expires_at = 0.0
+
+    def _get_token(self) -> str:
+        if self._token and time.time() < self._expires_at - 30:
+            return self._token
+        body = urllib.parse.urlencode(
+            {
+                "grant_type": "client_credentials",
+                "client_id": CCW_CLIENT_ID,
+                "client_secret": CCW_CLIENT_SECRET,
+            }
+        ).encode()
+        req = urllib.request.Request(
+            CCW_TOKEN_URL,
+            data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+        self._token = data["access_token"]
+        self._expires_at = time.time() + int(data.get("expires_in", 3600))
+        log.info("CCW token OK, expira en %ss", data.get("expires_in"))
+        return self._token
+
+    def get_order_details(
+        self,
+        order_search_key: str,
+        order_search_value: str,
+        page: int,
+        page_size: int,
+    ) -> dict:
+        token = self._get_token()
+        # sortByOrderCharacteristics es campo REQUERIDO por la API pese a no
+        # figurar como tal en la doc oficial de Cisco — sin él, error de
+        # validación. Ver deploy/skill-order-status-modern-graphql-2026-08-06.md.
+        query = (
+            "query GetOrderDetails { getOrderDetails(input: { orderSearchCriteria: "
+            "{ orderSearchKey: %s, orderSearchValue: \"%s\" }, "
+            "sortByOrderCharacteristics: ORDER_SUBMITTED_DATE, "
+            "pagination: { page: %d, pageSize: %d, sortOrder: DESC } }) "
+            "{ messages { code description } objects { id orderStatus "
+            "metaData { createdOn } ciscoSalesOrderReference { ciscoSalesOrderId } "
+            "buyerPurchaseOrderReference { purchaseOrderId } "
+            "priceList { code description } lines { item { sku description } "
+            "quantity { measurement unitOfMeasure } orderLineStatus "
+            "financialDetails { extendedNetPrice { amount currency } } } } } }"
+        ) % (order_search_key, order_search_value.replace('"', '\\"'), page, page_size)
+        req = urllib.request.Request(
+            CCW_API_URL,
+            data=json.dumps({"query": query}).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            body_txt = e.read().decode(errors="replace")
+            raise RuntimeError(f"CCW HTTP {e.code}: {body_txt[:500]}") from e
+
+
 sap = SapClient()
 ccwr = CcwrClient()
+ccw = CcwClient()
 
 
 # ---------------------------------------------------------------------------
@@ -255,14 +338,17 @@ ccwr = CcwrClient()
 mcp_server = FastMCP(
     name="hermes-sap-ccwr",
     instructions=(
-        "Herramientas de SOLO LECTURA contra SAP Business One (Service Layer) y la API de "
-        "contratos de servicio de Cisco (CCWR) de Trans Industrias. Nunca hay escritura: "
-        "sap_query/sap_get_entity solo arman GET; no existe ninguna tool de creación, "
-        "modificación o borrado. Usar sap_query para listar/filtrar documentos (Orders, "
-        "DeliveryNotes, PurchaseOrders, PurchaseDeliveryNotes, BusinessPartners, etc. — "
-        "ver la doc de entidades OData de SAP B1 Service Layer) y sap_get_entity cuando se "
-        "necesite el detalle completo de UN documento puntual (por ejemplo para traer "
-        "SerialNumbers, que SAP omite si la consulta usa $select)."
+        "Herramientas de SOLO LECTURA contra SAP Business One (Service Layer), la API de "
+        "contratos de servicio de Cisco (CCWR) y la API de estado de órdenes de Cisco (CCW) "
+        "de Trans Industrias. Nunca hay escritura: todas las tools solo arman GET/consultas; "
+        "no existe ninguna tool de creación, modificación o borrado. Usar sap_query para "
+        "listar/filtrar documentos (Orders, DeliveryNotes, PurchaseOrders, "
+        "PurchaseDeliveryNotes, BusinessPartners, etc. — ver la doc de entidades OData de "
+        "SAP B1 Service Layer) y sap_get_entity cuando se necesite el detalle completo de UN "
+        "documento puntual (por ejemplo para traer SerialNumbers, que SAP omite si la "
+        "consulta usa $select). Usar ccwr_search para contratos de servicio Cisco (soporte/"
+        "warranty) y ccw_order_status para el estado de órdenes de compra Cisco — son dos "
+        "APIs de Cisco distintas, no intercambiables."
     ),
     stateless_http=True,
     # El servidor se expone detrás de una Route/Service de OKD con hostnames
@@ -344,6 +430,31 @@ def ccwr_search(
         return json.dumps({"error": "hay que pasar al menos una lista no vacía"})
     try:
         data = ccwr.search(serial_numbers, contract_numbers, instance_numbers, limit, offset)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+    return json.dumps(data, ensure_ascii=False)
+
+
+@mcp_server.tool()
+def ccw_order_status(
+    order_search_key: str,
+    order_search_value: str,
+    page: int = 1,
+    page_size: int = 5,
+) -> str:
+    """Consulta el estado de una orden de compra/venta de Cisco (CCW — Commerce
+    GraphQL API). `order_search_key` es uno de los valores del enum de Cisco:
+    "SALES_ORDER_ID" (número de Sales Order), "PURCHASE_ORDER_ID" (número de PO),
+    "WEB_ORDER_ID", "DEAL_ID", "END_CUSTOMER_NAME", entre ~40 valores posibles.
+    `order_search_value` es el identificador a buscar (por ejemplo el número de
+    SO o de PO). Devuelve estado de la orden, referencia de PO del comprador,
+    líneas (SKU, descripción, cantidad, estado) y detalle de precio. Un
+    resultado vacío ("objects": []) con mensaje EXTNXG901 significa que la
+    cuenta no tiene acceso a ESA orden puntual, no que la orden no exista.
+    Distinto de ccwr_search: esto es estado de ÓRDENES, no de contratos.
+    """
+    try:
+        data = ccw.get_order_details(order_search_key, order_search_value, page, page_size)
     except Exception as e:
         return json.dumps({"error": str(e)})
     return json.dumps(data, ensure_ascii=False)

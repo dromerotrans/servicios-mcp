@@ -2,8 +2,9 @@
 
 Servidor MCP remoto (Streamable HTTP), de **SOLO CONSULTA** (nunca escribe
 ni modifica nada en SAP ni en Cisco), que expone la API de SAP Business One
-Service Layer y la API de contratos de servicio de Cisco (CCWR) usadas por
-el proyecto Hermes de Trans Industrias Electrónicas.
+Service Layer, la API de contratos de servicio de Cisco (CCWR) y la API de
+estado de órdenes de Cisco (CCW) usadas por el proyecto Hermes de Trans
+Industrias Electrónicas.
 
 Pensado para que un cliente externo (otro Claude, en otra cuenta) pueda
 agregarlo como conector MCP remoto y consultar los mismos datos sin acceso
@@ -11,8 +12,8 @@ directo al clúster ni a las credenciales reales de SAP/Cisco.
 
 ## Tools expuestas
 
-**Las tres tools son exclusivamente de lectura — no existe en este código
-ninguna tool que pueda crear, modificar o borrar nada en SAP ni en CCWR.**
+**Las cuatro tools son exclusivamente de lectura — no existe en este código
+ninguna tool que pueda crear, modificar o borrar nada en SAP, CCWR ni CCW.**
 
 - `sap_query(entity, select, filter, orderby, top, skip)` — `GET` genérico
   contra una colección OData de SAP B1 Service Layer (`Orders`,
@@ -22,13 +23,19 @@ ninguna tool que pueda crear, modificar o borrar nada en SAP ni en CCWR.**
   clave primaria (necesario para sub-colecciones anidadas como
   `SerialNumbers`, que SAP omite si la consulta usa `$select`).
 - `ccwr_search(serial_numbers, contract_numbers, instance_numbers, limit, offset)`
-  — búsqueda de contratos de servicio de Cisco.
+  — búsqueda de **contratos** de servicio de Cisco (soporte/warranty, API
+  CCWR — legacy).
+- `ccw_order_status(order_search_key, order_search_value, page, page_size)`
+  — estado de **órdenes** de compra/venta de Cisco (API CCW — Commerce
+  GraphQL). Distinto de `ccwr_search`: contratos y órdenes son dos APIs de
+  Cisco separadas, con credenciales propias cada una.
 
-**Regla no negociable, heredada de los skills `sap-service-layer` y
-`ccwr-contract-admin` de Hermes:** el servidor nunca arma un
-`POST`/`PATCH`/`DELETE` contra una entidad de datos de SAP o de CCWR. Las
-únicas llamadas POST del código son `Login`/`Logout` de sesión SAP y el
-token endpoint OAuth2 de Cisco — ambas de autenticación, ninguna de datos.
+**Regla no negociable, heredada de los skills `sap-service-layer`,
+`ccwr-contract-admin` y `order-status` de Hermes:** el servidor nunca arma
+un `POST`/`PATCH`/`DELETE` contra una entidad de datos de SAP, CCWR o CCW.
+Las únicas llamadas POST del código son `Login`/`Logout` de sesión SAP y
+los token endpoints OAuth2 de Cisco — todas de autenticación, ninguna de
+datos.
 
 ## Autenticación
 
@@ -46,10 +53,14 @@ puede revocar el acceso de una persona sin tocar nada más.
 | `SAP_SL_USERNAME` | Sí | Usuario SAP B1 |
 | `SAP_SL_PASSWORD` | Sí | Password SAP B1 |
 | `SAP_BASE_URL` | No (default `https://sap.trans.com.ar:50000/b1s/v1`) | Base de la Service Layer |
-| `CCWR_CLIENT_ID` | Sí (si se usa `ccwr_search`) | Client ID OAuth2 Cisco |
-| `CCWR_CLIENT_SECRET` | Sí (si se usa `ccwr_search`) | Client Secret OAuth2 Cisco |
-| `CCWR_TOKEN_URL` | No (default `https://id.cisco.com/oauth2/default/v1/token`) | Token endpoint |
-| `CCWR_API_URL` | No (default `.../ccw/renewals/api/v1.0/search/lines`) | Endpoint de búsqueda |
+| `CCWR_CLIENT_ID` | Sí (si se usa `ccwr_search`) | Client ID OAuth2 Cisco (contratos) |
+| `CCWR_CLIENT_SECRET` | Sí (si se usa `ccwr_search`) | Client Secret OAuth2 Cisco (contratos) |
+| `CCWR_TOKEN_URL` | No (default `https://id.cisco.com/oauth2/default/v1/token`) | Token endpoint CCWR |
+| `CCWR_API_URL` | No (default `.../ccw/renewals/api/v1.0/search/lines`) | Endpoint de búsqueda CCWR |
+| `CCW_CLIENT_ID` | Sí (si se usa `ccw_order_status`) | Client ID OAuth2 Cisco (órdenes) |
+| `CCW_CLIENT_SECRET` | Sí (si se usa `ccw_order_status`) | Client Secret OAuth2 Cisco (órdenes) |
+| `CCW_TOKEN_URL` | No (default `https://id.cisco.com/oauth2/default/v1/token`) | Token endpoint CCW |
+| `CCW_API_URL` | No (default `https://capi.cisco.com/commerce/apis`) | Endpoint GraphQL CCW |
 | `MCP_ACCESS_TOKENS` | Sí | Tokens de acceso al MCP, ver arriba |
 | `PORT` | No (default `8080`) | Puerto HTTP |
 
