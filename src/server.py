@@ -266,14 +266,24 @@ mcp_server = FastMCP(
     ),
     stateless_http=True,
     # El servidor se expone detrás de una Route/Service de OKD con hostnames
-    # reales (hermes-mcp.hermes.svc.cluster.local, hermes-mcp.trans.com.ar),
-    # nunca "127.0.0.1"/"localhost". La protección DNS-rebinding del SDK
-    # (activada por defecto solo para esos dos hosts) rechazaría cualquier
-    # Host header real con "Invalid Host header". El control de acceso real
-    # de este servidor es BearerAuthMiddleware (token propio por persona),
-    # así que la validación de Host queda deshabilitada aquí a propósito.
+    # reales (servicios-mcp.hermes.svc.cluster.local, servicios-mcp.trans.com.ar),
+    # nunca "127.0.0.1"/"localhost" — por default el SDK solo permite esos dos
+    # y rechaza cualquier otro Host header con "421 Invalid Host header".
+    # En vez de deshabilitar la protección entera, se restringe explícitamente
+    # a los hostnames reales de este servidor (capa adicional, redundante con
+    # BearerAuthMiddleware pero de costo cero — sigue endureciendo contra un
+    # ataque de DNS-rebinding real).
     transport_security=TransportSecuritySettings(
-        enable_dns_rebinding_protection=False,
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[
+            "servicios-mcp.trans.com.ar",
+            "servicios-mcp.trans.com.ar:*",
+            "servicios-mcp.hermes.svc.cluster.local",
+            "servicios-mcp.hermes.svc.cluster.local:*",
+            "localhost:*",
+            "127.0.0.1:*",
+        ],
+        allowed_origins=[],
     ),
 )
 
@@ -348,14 +358,20 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.url.path in ("/healthz",):
             return await call_next(request)
+        client_ip = request.client.host if request.client else "?"
         auth = request.headers.get("authorization", "")
         if not auth.startswith("Bearer "):
+            log.warning("AUTH_FAIL sin-token ip=%s path=%s", client_ip, request.url.path)
             return JSONResponse({"error": "falta Authorization: Bearer <token>"}, status_code=401)
         token = auth[len("Bearer "):].strip()
         label = VALID_TOKENS.get(token)
         if not label:
+            log.warning("AUTH_FAIL token-invalido ip=%s path=%s", client_ip, request.url.path)
             return JSONResponse({"error": "token inválido"}, status_code=401)
         request.state.token_label = label
+        # Auditoría: quién (etiqueta del token) pega qué endpoint y desde
+        # dónde, en cada request autenticado — visible con `oc logs`.
+        log.info("AUTH_OK label=%s ip=%s path=%s", label, client_ip, request.url.path)
         return await call_next(request)
 
 
