@@ -23,6 +23,7 @@ de sesión SAP y el token endpoint OAuth2 de Cisco.
 """
 
 import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -91,6 +92,14 @@ if not VALID_TOKENS:
     )
 
 MAX_TOP = 1000  # tope duro, evita que un $top gigante tire abajo el server o SAP
+
+# Etiqueta del token (persona) del request en curso, seteada por
+# BearerAuthMiddleware antes de despachar y leída dentro de cada tool para
+# poder loguear "qué token hizo qué" (no solo "qué token pegó qué path" —
+# todas las tools comparten el mismo path /mcp).
+current_token_label: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "current_token_label", default="?"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +400,10 @@ def sap_query(
     por llamada — para traer más, paginar con `skip`. Devuelve el JSON crudo de SAP
     (incluye "value": [...] y, si hay más páginas, "odata.nextLink").
     """
+    log.info(
+        "TOOL_CALL tool=sap_query label=%s entity=%s filter=%r top=%s skip=%s",
+        current_token_label.get(), entity, filter, top, skip,
+    )
     try:
         data = sap.query(entity, select, filter, orderby, top, skip)
     except Exception as e:
@@ -406,6 +419,10 @@ def sap_get_entity(entity: str, entry_id: str) -> str:
     con $select, como SerialNumbers dentro de DocumentLines. Ejemplo:
     sap_get_entity("DeliveryNotes", "3134").
     """
+    log.info(
+        "TOOL_CALL tool=sap_get_entity label=%s entity=%s entry_id=%s",
+        current_token_label.get(), entity, entry_id,
+    )
     try:
         data = sap.get_entity(entity, entry_id)
     except Exception as e:
@@ -426,6 +443,10 @@ def ccwr_search(
     listas. Devuelve el JSON crudo de la API de Cisco. Útil para saber si un equipo
     tiene contrato de soporte activo y su vigencia.
     """
+    log.info(
+        "TOOL_CALL tool=ccwr_search label=%s serial_numbers=%s contract_numbers=%s instance_numbers=%s",
+        current_token_label.get(), serial_numbers, contract_numbers, instance_numbers,
+    )
     if not (serial_numbers or contract_numbers or instance_numbers):
         return json.dumps({"error": "hay que pasar al menos una lista no vacía"})
     try:
@@ -453,6 +474,10 @@ def ccw_order_status(
     cuenta no tiene acceso a ESA orden puntual, no que la orden no exista.
     Distinto de ccwr_search: esto es estado de ÓRDENES, no de contratos.
     """
+    log.info(
+        "TOOL_CALL tool=ccw_order_status label=%s order_search_key=%s order_search_value=%s",
+        current_token_label.get(), order_search_key, order_search_value,
+    )
     try:
         data = ccw.get_order_details(order_search_key, order_search_value, page, page_size)
     except Exception as e:
@@ -483,7 +508,11 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         # Auditoría: quién (etiqueta del token) pega qué endpoint y desde
         # dónde, en cada request autenticado — visible con `oc logs`.
         log.info("AUTH_OK label=%s ip=%s path=%s", label, client_ip, request.url.path)
-        return await call_next(request)
+        token_ctx = current_token_label.set(label)
+        try:
+            return await call_next(request)
+        finally:
+            current_token_label.reset(token_ctx)
 
 
 async def healthz(request: Request) -> JSONResponse:
