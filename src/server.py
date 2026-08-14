@@ -33,6 +33,13 @@ mismo token personal que ya usa Claude Code — no es un usuario/password
 nuevo. El access_token que se emite ES ese mismo token personal (revocable
 desde /admin en cualquier momento), no uno nuevo con expiración propia.
 
+Gestión de IPs habilitadas: el panel /admin también permite agregar/quitar
+IPs y CIDRs de la whitelist de la Route (`ip_whitelist`) sin correr `oc` a
+mano. El propio pod tiene permiso de Kubernetes (RBAC acotado por
+`resourceNames` a esta única Route, solo verbos get/patch) para leer y
+editar esa anotación directo contra la API in-cluster — el bloqueo sigue
+pasando en HAProxy/Route (capa de red), no se movió a la aplicación.
+
 Reglas heredadas del skill sap-service-layer de Hermes (no negociables):
 SOLO LECTURA contra SAP. El servidor nunca arma un POST/PATCH/DELETE
 contra una entidad de datos — las únicas llamadas POST son Login/Logout
@@ -43,6 +50,7 @@ import base64
 import collections
 import contextlib
 import contextvars
+import ipaddress
 import json
 import logging
 import os
@@ -132,6 +140,28 @@ OAUTH_RESOURCE_URL = AnyHttpUrl(f"{PUBLIC_BASE_URL}/mcp")
 # URL de metadata (RFC 9728) que el cliente MCP debe consultar tras un 401 —
 # va en el header WWW-Authenticate de cada 401 de /mcp.
 RESOURCE_METADATA_URL = build_resource_metadata_url(OAUTH_RESOURCE_URL)
+
+# Gestión de la whitelist de IP de la Route desde /admin — ver KubeRouteClient
+# más abajo. ROUTE_NAME/K8S_NAMESPACE identifican el único objeto que el
+# ServiceAccount de este pod puede leer/editar (RBAC con resourceNames).
+ROUTE_NAME = os.environ.get("ROUTE_NAME", "servicios-mcp")
+IP_ALLOWLIST_FILE = os.environ.get("IP_ALLOWLIST_FILE", "/data/ip_allowlist.json")
+_SA_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+_SA_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+_SA_NAMESPACE_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+
+
+def _detect_namespace() -> str:
+    env = os.environ.get("K8S_NAMESPACE")
+    if env:
+        return env
+    if os.path.exists(_SA_NAMESPACE_PATH):
+        with open(_SA_NAMESPACE_PATH) as f:
+            return f.read().strip()
+    return "hermes"
+
+
+K8S_NAMESPACE = _detect_namespace()
 
 
 def _now_iso() -> str:
@@ -267,7 +297,150 @@ class OAuthClientStore:
             self._save()
 
 
+# ---------------------------------------------------------------------------
+# Cliente Kubernetes — permite gestionar la whitelist de IP de la propia
+# Route desde el panel /admin, sin depender de que Diego corra `oc` a mano.
+# Usa la API in-cluster (token + CA que Kubernetes monta automáticamente en
+# cada pod, vía el ServiceAccount del Deployment) con dos llamadas HTTP
+# (GET/PATCH) contra `/apis/route.openshift.io/v1/namespaces/.../routes/...`
+# — no hace falta ningún SDK de Kubernetes para esto. El ServiceAccount de
+# este Deployment tiene, vía RBAC, permiso de get/patch RESTRINGIDO POR
+# resourceNames a esta única Route — no puede leer ni tocar ningún otro
+# objeto del namespace. Ver deploy/hermes-mcp-servidor-remoto-2026-08-14.md,
+# sección "Gestión de IPs desde /admin", para el YAML de RBAC aplicado.
+# ---------------------------------------------------------------------------
+
+IP_WHITELIST_ANNOTATION = "haproxy.router.openshift.io/ip_whitelist"
+
+
+class KubeRouteClient:
+    """Cliente mínimo (GET/PATCH) para UNA Route puntual de OpenShift, vía la
+    API de Kubernetes in-cluster. Sin SDK — dos llamadas HTTP con el token
+    del ServiceAccount del pod, releído del disco en cada llamada (el token
+    proyectado por Kubernetes rota, por default cada 1h — nunca se cachea)."""
+
+    def __init__(self, namespace: str, route_name: str) -> None:
+        self._path = f"/apis/route.openshift.io/v1/namespaces/{namespace}/routes/{route_name}"
+        self._base = "https://kubernetes.default.svc"
+        self._ctx = ssl.create_default_context(cafile=_SA_CA_PATH) if os.path.exists(_SA_CA_PATH) else None
+
+    def _token(self) -> str:
+        try:
+            with open(_SA_TOKEN_PATH) as f:
+                return f.read().strip()
+        except OSError as e:
+            raise RuntimeError(f"no se pudo leer el token del ServiceAccount ({_SA_TOKEN_PATH}): {e}") from e
+
+    def _request(self, method: str, body: bytes | None = None, content_type: str | None = None) -> dict:
+        headers = {"Authorization": f"Bearer {self._token()}", "Accept": "application/json"}
+        if content_type:
+            headers["Content-Type"] = content_type
+        req = urllib.request.Request(f"{self._base}{self._path}", data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=10, context=self._ctx) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")
+            raise RuntimeError(
+                f"Kubernetes API HTTP {e.code} en {method} {self._path}: {detail[:400]}"
+            ) from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Kubernetes API inalcanzable ({method} {self._path}): {e}") from e
+
+    def get_whitelist(self) -> str:
+        route = self._request("GET")
+        return (route.get("metadata", {}).get("annotations") or {}).get(IP_WHITELIST_ANNOTATION, "")
+
+    def set_whitelist(self, value: str) -> None:
+        patch = {"metadata": {"annotations": {IP_WHITELIST_ANNOTATION: value}}}
+        self._request("PATCH", body=json.dumps(patch).encode(), content_type="application/merge-patch+json")
+
+
+class IpAllowlistStore:
+    """Store de IPs/CIDRs habilitadas, persistido como JSON (mismo PVC que
+    TokenStore) y sincronizado con la Route en cada cambio vía
+    KubeRouteClient. El store local es la fuente de verdad de a quién
+    pertenece cada entrada (etiqueta) — la Route solo guarda la lista de
+    IPs/CIDRs sin contexto, así que en cada add/remove se le manda la unión
+    completa del store, nunca un edit parcial.
+
+    Si `add`/`remove` no puede sincronizar con la Route (por ejemplo, el
+    RBAC todavía no está aplicado), la excepción se propaga SIN persistir
+    el cambio local — el store y la Route real nunca deben quedar
+    desincronizados entre sí.
+    """
+
+    def __init__(self, path: str, kube: "KubeRouteClient") -> None:
+        self._path = path
+        self._kube = kube
+        self._lock = threading.Lock()
+        self._data: list[dict] = []
+        self._load_or_seed()
+
+    def _load_or_seed(self) -> None:
+        os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
+        if os.path.exists(self._path):
+            with open(self._path) as f:
+                self._data = json.load(f)
+            return
+        try:
+            current = self._kube.get_whitelist()
+        except Exception as e:
+            log.warning(
+                "IpAllowlistStore: no se pudo leer la whitelist actual de la Route al "
+                "arrancar (¿falta aplicar el RBAC todavía?) — arranca con lista vacía "
+                "local; la Route real no se toca hasta el primer add/remove exitoso: %s",
+                e,
+            )
+            current = ""
+        self._data = [
+            {"cidr": tok, "label": "importado", "added_at": _now_iso()} for tok in current.split() if tok
+        ]
+        self._save()
+        log.info("IpAllowlistStore sembrado desde la Route (%d entrada/s)", len(self._data))
+
+    def _save(self) -> None:
+        tmp = f"{self._path}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(self._data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, self._path)
+
+    def list(self) -> list[dict]:
+        with self._lock:
+            return list(self._data)
+
+    def add(self, cidr: str, label: str) -> dict:
+        cidr = cidr.strip()
+        try:
+            network = ipaddress.ip_network(cidr, strict=False)
+        except ValueError as e:
+            raise ValueError(f"CIDR/IP inválido: {cidr!r} ({e})") from e
+        normalized = str(network) if "/" in cidr else cidr
+        with self._lock:
+            if any(entry["cidr"] == normalized for entry in self._data):
+                raise ValueError(f"{normalized} ya está en la lista")
+            entry = {"cidr": normalized, "label": label.strip() or "sin-etiqueta", "added_at": _now_iso()}
+            new_data = [*self._data, entry]
+            self._kube.set_whitelist(" ".join(e["cidr"] for e in new_data))
+            self._data = new_data
+            self._save()
+            return entry
+
+    def remove(self, cidr: str) -> bool:
+        with self._lock:
+            new_data = [entry for entry in self._data if entry["cidr"] != cidr]
+            if len(new_data) == len(self._data):
+                return False
+            self._kube.set_whitelist(" ".join(e["cidr"] for e in new_data))
+            self._data = new_data
+            self._save()
+            return True
+
+
 oauth_client_store = OAuthClientStore(OAUTH_CLIENTS_FILE)
+
+kube_route_client = KubeRouteClient(K8S_NAMESPACE, ROUTE_NAME)
+ip_allowlist_store = IpAllowlistStore(IP_ALLOWLIST_FILE, kube_route_client)
 
 token_store = TokenStore(TOKENS_FILE)
 
@@ -367,6 +540,11 @@ def _audit_auth_fail(reason: str, ip: str, path: str) -> None:
 def _audit_oauth_login(label: str, ip: str, client_id: str, client_name: str | None) -> None:
     log.info("OAUTH_LOGIN_OK label=%s ip=%s client_id=%s client_name=%s", label, ip, client_id, client_name)
     audit_log.append(event="oauth_login", label=label, ip=ip, client_id=client_id, client_name=client_name)
+
+
+def _audit_ip_whitelist_change(action: str, cidr: str, label: str, admin_ip: str) -> None:
+    log.info("IP_WHITELIST_%s cidr=%s label=%s admin_ip=%s", action.upper(), cidr, label, admin_ip)
+    audit_log.append(event="ip_whitelist_change", action=action, cidr=cidr, label=label, ip=admin_ip)
 
 
 # ---------------------------------------------------------------------------
@@ -1013,6 +1191,7 @@ ADMIN_HTML = """<!DOCTYPE html>
   .badge.tool_call { background: #2a83; }
   .badge.auth_fail { background: #c333; }
   .badge.oauth_login { background: #a3a3; }
+  .badge.ip_whitelist_change { background: #6a63; }
   .toolbar { display: flex; justify-content: space-between; align-items: center; }
 </style>
 </head>
@@ -1029,6 +1208,23 @@ ADMIN_HTML = """<!DOCTYPE html>
 <table id="tbl">
   <thead><tr>
     <th>Etiqueta</th><th>Token</th><th>Creado</th><th>Último uso</th><th>Llamadas</th><th></th>
+  </tr></thead>
+  <tbody></tbody>
+</table>
+
+<h2>IPs habilitadas (whitelist de la Route)</h2>
+<p class="muted">Se aplica directo sobre la Route del clúster (capa de red,
+antes de llegar a la aplicación) — el cambio queda activo al toque, sin
+redeploy. Ojo: si administrás este panel desde una IP que no está en la
+lista, no vas a poder entrar — no la quites por error.</p>
+<div class="row">
+  <input type="text" id="ip-cidr" placeholder="IP o CIDR (ej: 190.210.236.14 o 160.79.104.0/21)">
+  <input type="text" id="ip-label" placeholder="Etiqueta (ej: Diego, colega, Anthropic)">
+  <button id="add-ip">+ Agregar</button>
+</div>
+<table id="ip-tbl">
+  <thead><tr>
+    <th>IP / CIDR</th><th>Etiqueta</th><th>Agregada</th><th></th>
   </tr></thead>
   <tbody></tbody>
 </table>
@@ -1100,7 +1296,8 @@ async function loadAudit() {
   tbody.innerHTML = '';
   for (const e of items) {
     const tr = document.createElement('tr');
-    const label = e.event === 'auth_fail' ? e.reason : e.label;
+    let label = e.event === 'auth_fail' ? e.reason : e.label;
+    if (e.event === 'ip_whitelist_change') label = `${e.action} ${e.cidr}${e.label ? ' (' + e.label + ')' : ''}`;
     const params = e.params ? JSON.stringify(e.params) : '';
     tr.innerHTML = `
       <td>${fmt(e.ts)}</td>
@@ -1114,6 +1311,45 @@ async function loadAudit() {
   }
 }
 document.querySelector('#refresh-audit').onclick = loadAudit;
+
+async function loadIps() {
+  const items = await api('/admin/api/ips');
+  const tbody = document.querySelector('#ip-tbl tbody');
+  tbody.innerHTML = '';
+  for (const e of items) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><code>${e.cidr}</code></td>
+      <td>${e.label}</td>
+      <td>${fmt(e.added_at)}</td>
+      <td><button class="danger remove-ip" data-cidr="${e.cidr}">quitar</button></td>
+    `;
+    tbody.appendChild(tr);
+  }
+  tbody.querySelectorAll('.remove-ip').forEach(b => b.onclick = async () => {
+    if (!confirm(`¿Quitar ${b.dataset.cidr} de la whitelist? Se aplica al toque contra la Route.`)) return;
+    try {
+      await api('/admin/api/ips?cidr=' + encodeURIComponent(b.dataset.cidr), { method: 'DELETE' });
+      loadIps(); loadAudit();
+    } catch (e) { alert('Error: ' + e.message); }
+  });
+}
+
+document.querySelector('#add-ip').onclick = async () => {
+  const cidr = document.querySelector('#ip-cidr').value.trim();
+  const label = document.querySelector('#ip-label').value.trim();
+  if (!cidr) { alert('Poné una IP o CIDR primero'); return; }
+  try {
+    await api('/admin/api/ips', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cidr, label }),
+    });
+    document.querySelector('#ip-cidr').value = '';
+    document.querySelector('#ip-label').value = '';
+    loadIps(); loadAudit();
+  } catch (e) { alert('Error: ' + e.message); }
+};
 
 document.querySelector('#add').onclick = async () => {
   const label = document.querySelector('#label').value.trim();
@@ -1135,6 +1371,7 @@ document.querySelector('#add').onclick = async () => {
 
 load();
 loadAudit();
+loadIps();
 </script>
 </body>
 </html>"""
@@ -1176,6 +1413,48 @@ async def admin_list_audit(request: Request) -> JSONResponse:
     except ValueError:
         limit = 200
     return JSONResponse(audit_log.list(limit))
+
+
+async def admin_list_ips(request: Request) -> JSONResponse:
+    return JSONResponse(ip_allowlist_store.list())
+
+
+async def admin_add_ip(request: Request) -> JSONResponse:
+    body = await request.json()
+    cidr = str(body.get("cidr", "")).strip()
+    label = str(body.get("label", "")).strip()
+    if not cidr:
+        return JSONResponse({"error": "falta 'cidr'"}, status_code=400)
+    admin_ip = request.client.host if request.client else "?"
+    try:
+        entry = ip_allowlist_store.add(cidr, label)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except RuntimeError as e:
+        log.error("ADMIN_IP_ADD_FAILED cidr=%s error=%s", cidr, e)
+        return JSONResponse(
+            {"error": f"no se pudo sincronizar con la Route (¿falta el RBAC?): {e}"}, status_code=502
+        )
+    _audit_ip_whitelist_change("add", entry["cidr"], entry["label"], admin_ip)
+    return JSONResponse(entry)
+
+
+async def admin_remove_ip(request: Request) -> Response:
+    cidr = request.query_params.get("cidr", "").strip()
+    if not cidr:
+        return JSONResponse({"error": "falta 'cidr'"}, status_code=400)
+    admin_ip = request.client.host if request.client else "?"
+    try:
+        removed = ip_allowlist_store.remove(cidr)
+    except RuntimeError as e:
+        log.error("ADMIN_IP_REMOVE_FAILED cidr=%s error=%s", cidr, e)
+        return JSONResponse(
+            {"error": f"no se pudo sincronizar con la Route (¿falta el RBAC?): {e}"}, status_code=502
+        )
+    if not removed:
+        return JSONResponse({"error": "esa IP/CIDR no está en la lista"}, status_code=404)
+    _audit_ip_whitelist_change("remove", cidr, "", admin_ip)
+    return Response(status_code=204)
 
 
 # ---------------------------------------------------------------------------
@@ -1303,6 +1582,9 @@ def build_app() -> Starlette:
             Route("/admin/api/tokens", admin_create_token, methods=["POST"]),
             Route("/admin/api/tokens/{label}", admin_revoke_token, methods=["DELETE"]),
             Route("/admin/api/audit", admin_list_audit, methods=["GET"]),
+            Route("/admin/api/ips", admin_list_ips, methods=["GET"]),
+            Route("/admin/api/ips", admin_add_ip, methods=["POST"]),
+            Route("/admin/api/ips", admin_remove_ip, methods=["DELETE"]),
             Route("/oauth/login", oauth_login_get, methods=["GET"]),
             Route("/oauth/login", oauth_login_post, methods=["POST"]),
             *oauth_routes,

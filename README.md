@@ -57,6 +57,20 @@ Dos formas de usar ese mismo token:
   emite **es ese mismo token** (revocable desde `/admin`, sin lógica de
   expiración/refresh propia). No hay usuarios ni contraseñas nuevas.
 
+## Panel `/admin` — gestión de IPs habilitadas
+
+Además de los tokens, `/admin` permite agregar/quitar IPs y CIDRs de la
+whitelist de la propia Route (`haproxy.router.openshift.io/ip_whitelist`)
+sin correr `oc` a mano — el cambio se aplica al toque contra la Route real
+(capa de red/HAProxy, no se movió el bloqueo a la aplicación). El pod
+necesita permiso de Kubernetes (RBAC) para leer y editar SOLO esa Route
+puntual (`get`/`patch`, acotado por `resourceNames` — no puede tocar
+ningún otro objeto del namespace); ver `rbac-ip-whitelist.yaml` para el
+`ServiceAccount`/`Role`/`RoleBinding` que hay que aplicar antes de que
+esta sección del panel funcione. API REST: `GET /admin/api/ips`,
+`POST /admin/api/ips` (`{"cidr": "...", "label": "..."}`),
+`DELETE /admin/api/ips?cidr=...`.
+
 ## Panel `/admin` — gestión de tokens
 
 `GET /admin` sirve una página HTML+JS (sin dependencias nuevas) protegida
@@ -93,6 +107,9 @@ efecto real. API REST detrás del mismo Basic Auth:
 | `ADMIN_PASSWORD` | Sí | Password del panel `/admin` |
 | `PUBLIC_BASE_URL` | No (default `https://servicios-mcp.trans.com.ar`) | URL pública canónica, usada en la metadata OAuth2 (issuer, resource) |
 | `OAUTH_CLIENTS_FILE` | No (default `/data/oauth_clients.json`) | Store persistente de clientes OAuth registrados dinámicamente (DCR) |
+| `ROUTE_NAME` | No (default `servicios-mcp`) | Nombre de la Route que `/admin` edita para la whitelist de IP |
+| `K8S_NAMESPACE` | No (autodetectado del ServiceAccount in-cluster; fallback `hermes`) | Namespace de esa Route |
+| `IP_ALLOWLIST_FILE` | No (default `/data/ip_allowlist.json`) | Store persistente de IPs/CIDRs habilitadas, gestionado desde `/admin` |
 | `PORT` | No (default `8080`) | Puerto HTTP |
 
 ## Correr local
