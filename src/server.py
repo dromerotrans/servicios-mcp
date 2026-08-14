@@ -1168,12 +1168,13 @@ ADMIN_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>servicios-mcp — tokens</title>
+<title>servicios-mcp — admin</title>
 <style>
   :root { color-scheme: light dark; }
-  body { font-family: -apple-system, system-ui, sans-serif; max-width: 900px;
-         margin: 2rem auto; padding: 0 1rem; line-height: 1.4; }
-  h1 { font-size: 1.3rem; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 1000px;
+         margin: 0 auto; padding: 0 1rem 3rem; line-height: 1.4; }
+  h1 { font-size: 1.15rem; margin: 0; }
   table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
   th, td { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid #8883; }
   th { font-size: 0.8rem; text-transform: uppercase; opacity: 0.7; }
@@ -1185,7 +1186,7 @@ ADMIN_HTML = """<!DOCTYPE html>
   .muted { opacity: 0.65; font-size: 0.85em; }
   .newtoken { background: #2a82; border: 1px solid #2a8; padding: 0.7rem 1rem; border-radius: 8px; margin: 1rem 0; }
   .newtoken code { font-size: 1rem; }
-  h2 { font-size: 1.05rem; margin-top: 2.5rem; }
+  h2 { font-size: 1.05rem; margin-top: 0; }
   .params { font-size: 0.8em; opacity: 0.8; max-width: 320px; overflow-wrap: anywhere; }
   .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.75em; }
   .badge.tool_call { background: #2a83; }
@@ -1193,55 +1194,109 @@ ADMIN_HTML = """<!DOCTYPE html>
   .badge.oauth_login { background: #a3a3; }
   .badge.ip_whitelist_change { background: #6a63; }
   .toolbar { display: flex; justify-content: space-between; align-items: center; }
+
+  .topbar { position: sticky; top: 0; background: Canvas; z-index: 10;
+            display: flex; align-items: center; gap: 1.5rem; padding: 1rem 0 0.6rem;
+            border-bottom: 1px solid #8883; margin-bottom: 1.5rem; flex-wrap: wrap; }
+  nav.tabs { display: flex; gap: 0.3rem; flex: 1; }
+  nav.tabs button { border: none; background: transparent; padding: 0.5rem 0.9rem;
+                     border-radius: 6px; opacity: 0.6; font-size: 0.95rem; }
+  nav.tabs button.active { opacity: 1; background: #8882; font-weight: 600; }
+  #logout { border-color: #8886; opacity: 0.75; }
+  .panel { display: none; }
+  .panel.active { display: block; }
 </style>
 </head>
 <body>
-<h1>servicios-mcp — tokens de acceso</h1>
-<p class="muted">SAP + CCWR (contratos) + CCW (órdenes) — solo lectura.</p>
-
-<div class="row">
-  <input type="text" id="label" placeholder="Nombre de la persona (etiqueta)">
-  <button id="add">+ Generar token</button>
+<div class="topbar">
+  <h1>servicios-mcp</h1>
+  <nav class="tabs">
+    <button class="tab active" data-tab="tokens">Tokens</button>
+    <button class="tab" data-tab="ips">IPs habilitadas</button>
+    <button class="tab" data-tab="audit">Auditoría</button>
+  </nav>
+  <button id="logout">Cerrar sesión</button>
 </div>
-<div id="newtoken"></div>
 
-<table id="tbl">
-  <thead><tr>
-    <th>Etiqueta</th><th>Token</th><th>Creado</th><th>Último uso</th><th>Llamadas</th><th></th>
-  </tr></thead>
-  <tbody></tbody>
-</table>
+<section id="tab-tokens" class="panel active">
+  <h2>Tokens de acceso</h2>
+  <p class="muted">SAP + CCWR (contratos) + CCW (órdenes) — solo lectura.</p>
 
-<h2>IPs habilitadas (whitelist de la Route)</h2>
-<p class="muted">Se aplica directo sobre la Route del clúster (capa de red,
-antes de llegar a la aplicación) — el cambio queda activo al toque, sin
-redeploy. Ojo: si administrás este panel desde una IP que no está en la
-lista, no vas a poder entrar — no la quites por error.</p>
-<div class="row">
-  <input type="text" id="ip-cidr" placeholder="IP o CIDR (ej: 190.210.236.14 o 160.79.104.0/21)">
-  <input type="text" id="ip-label" placeholder="Etiqueta (ej: Diego, colega, Anthropic)">
-  <button id="add-ip">+ Agregar</button>
-</div>
-<table id="ip-tbl">
-  <thead><tr>
-    <th>IP / CIDR</th><th>Etiqueta</th><th>Agregada</th><th></th>
-  </tr></thead>
-  <tbody></tbody>
-</table>
+  <div class="row">
+    <input type="text" id="label" placeholder="Nombre de la persona (etiqueta)">
+    <button id="add">+ Generar token</button>
+  </div>
+  <div id="newtoken"></div>
 
-<div class="toolbar">
-  <h2>Registro de auditoría</h2>
-  <button id="refresh-audit">↻ actualizar</button>
-</div>
-<p class="muted">Últimos eventos: llamadas a tools y autenticaciones fallidas. No se poda solo — el archivo completo queda en el servidor.</p>
-<table id="audit-tbl">
-  <thead><tr>
-    <th>Fecha</th><th>Evento</th><th>Etiqueta / motivo</th><th>Tool</th><th>Parámetros</th><th>IP</th>
-  </tr></thead>
-  <tbody></tbody>
-</table>
+  <table id="tbl">
+    <thead><tr>
+      <th>Etiqueta</th><th>Token</th><th>Creado</th><th>Último uso</th><th>Llamadas</th><th></th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<section id="tab-ips" class="panel">
+  <h2>IPs habilitadas (whitelist de la Route)</h2>
+  <p class="muted">Se aplica directo sobre la Route del clúster (capa de red,
+  antes de llegar a la aplicación) — el cambio queda activo al toque, sin
+  redeploy. Ojo: si administrás este panel desde una IP que no está en la
+  lista, no vas a poder entrar — no la quites por error.</p>
+  <div class="row">
+    <input type="text" id="ip-cidr" placeholder="IP o CIDR (ej: 190.210.236.14 o 160.79.104.0/21)">
+    <input type="text" id="ip-label" placeholder="Etiqueta (ej: Diego, colega, Anthropic)">
+    <button id="add-ip">+ Agregar</button>
+  </div>
+  <table id="ip-tbl">
+    <thead><tr>
+      <th>IP / CIDR</th><th>Etiqueta</th><th>Agregada</th><th></th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<section id="tab-audit" class="panel">
+  <div class="toolbar">
+    <h2>Registro de auditoría</h2>
+    <button id="refresh-audit">↻ actualizar</button>
+  </div>
+  <p class="muted">Últimos eventos: llamadas a tools y autenticaciones fallidas. No se poda solo — el archivo completo queda en el servidor.</p>
+  <table id="audit-tbl">
+    <thead><tr>
+      <th>Fecha</th><th>Evento</th><th>Etiqueta / motivo</th><th>Tool</th><th>Parámetros</th><th>IP</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
 
 <script>
+document.querySelectorAll('nav.tabs .tab').forEach(btn => btn.onclick = () => {
+  document.querySelectorAll('nav.tabs .tab').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  btn.classList.add('active');
+  document.querySelector('#tab-' + btn.dataset.tab).classList.add('active');
+});
+
+document.querySelector('#logout').onclick = async () => {
+  // HTTP Basic Auth no tiene logout real — el truco estándar es forzar un
+  // 401 con credenciales deliberadamente inválidas contra el mismo realm,
+  // lo que hace que la mayoría de los navegadores descarten la credencial
+  // cacheada. No es 100% instantáneo/uniforme en todos los navegadores —
+  // cerrar la pestaña/ventana sigue siendo la forma segura de terminar la
+  // sesión.
+  try {
+    await fetch(location.pathname, {
+      headers: { Authorization: 'Basic ' + btoa('logout:' + Math.random()) },
+      cache: 'no-store',
+    });
+  } catch (e) { /* esperado: 401 */ }
+  document.body.innerHTML = `
+    <div style="max-width:420px;margin:4rem auto;text-align:center;">
+      <h1>Sesión cerrada</h1>
+      <p class="muted">Cerrá esta pestaña, o recargá la página para volver a entrar.</p>
+    </div>`;
+};
+
 async function api(path, opts) {
   const res = await fetch(path, opts);
   if (!res.ok) throw new Error(await res.text());
@@ -1574,6 +1629,24 @@ def build_app() -> Starlette:
         resource_name="servicios-mcp",
     )
 
+    # Compat: si el conector se configura con la URL SIN el sufijo /mcp
+    # (ej. "https://servicios-mcp.trans.com.ar" a secas), el descubrimiento
+    # OAuth sigue funcionando bien (la metadata siempre anuncia el resource
+    # real, ".../mcp"), pero el handshake MCP final (POST/GET) se hace
+    # contra la raíz "/" tal como la configuraron — y esta app solo sabe
+    # responder en "/mcp", así que daba 404 después de una autorización
+    # exitosa ("authorized, but no MCP server was found..."). Reescribe
+    # SOLO el path raíz hacia /mcp antes de delegar a la misma app — no
+    # duplica tools ni estado, /mcp sigue funcionando exactamente igual.
+    mcp_asgi_app = mcp_server.streamable_http_app()
+
+    async def mcp_root_compat(scope, receive, send):
+        if scope["type"] == "http" and scope.get("path") == "/":
+            scope = dict(scope)
+            scope["path"] = "/mcp"
+            scope["raw_path"] = b"/mcp"
+        await mcp_asgi_app(scope, receive, send)
+
     app = Starlette(
         routes=[
             Route("/healthz", healthz),
@@ -1589,7 +1662,7 @@ def build_app() -> Starlette:
             Route("/oauth/login", oauth_login_post, methods=["POST"]),
             *oauth_routes,
             *protected_resource_routes,
-            Mount("/", app=mcp_server.streamable_http_app()),
+            Mount("/", app=mcp_root_compat),
         ],
         middleware=[Middleware(BearerAuthMiddleware)],
         lifespan=lifespan,
