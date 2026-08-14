@@ -34,6 +34,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -260,6 +261,16 @@ mcp_server = FastMCP(
         "SerialNumbers, que SAP omite si la consulta usa $select)."
     ),
     stateless_http=True,
+    # El servidor se expone detrás de una Route/Service de OKD con hostnames
+    # reales (hermes-mcp.hermes.svc.cluster.local, hermes-mcp.trans.com.ar),
+    # nunca "127.0.0.1"/"localhost". La protección DNS-rebinding del SDK
+    # (activada por defecto solo para esos dos hosts) rechazaría cualquier
+    # Host header real con "Invalid Host header". El control de acceso real
+    # de este servidor es BearerAuthMiddleware (token propio por persona),
+    # así que la validación de Host queda deshabilitada aquí a propósito.
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+    ),
 )
 
 
