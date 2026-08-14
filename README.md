@@ -44,6 +44,19 @@ desde el panel web `/admin` (ver abajo) — cada persona tiene su propio
 token, independiente de las credenciales reales de SAP/Cisco, así que se
 puede revocar el acceso de una persona sin tocar nada más ni redeployar.
 
+Dos formas de usar ese mismo token:
+
+- **Directo (Claude Code):** `--header "Authorization: Bearer <token>"`.
+- **OAuth2 (Claude Desktop):** el servidor implementa su propio
+  Authorization Server OAuth 2.1 (RFC 8414/9728, DCR RFC 7591, vía el
+  soporte nativo del SDK `mcp.server.auth`) para que Claude Desktop —que
+  solo sabe hablar OAuth, no un Bearer fijo— pueda agregar el conector
+  pegando solo la URL. El flujo: Claude Desktop se autoregistra como
+  cliente OAuth (`POST /register`), abre el navegador en `/oauth/login`,
+  la persona pega ahí su token de siempre, y el `access_token` que se
+  emite **es ese mismo token** (revocable desde `/admin`, sin lógica de
+  expiración/refresh propia). No hay usuarios ni contraseñas nuevas.
+
 ## Panel `/admin` — gestión de tokens
 
 `GET /admin` sirve una página HTML+JS (sin dependencias nuevas) protegida
@@ -78,6 +91,8 @@ efecto real. API REST detrás del mismo Basic Auth:
 | `TOKENS_FILE` | No (default `/data/tokens.json`) | Store persistente de tokens, gestionado desde `/admin` |
 | `ADMIN_USER` | Sí | Usuario del panel `/admin` |
 | `ADMIN_PASSWORD` | Sí | Password del panel `/admin` |
+| `PUBLIC_BASE_URL` | No (default `https://servicios-mcp.trans.com.ar`) | URL pública canónica, usada en la metadata OAuth2 (issuer, resource) |
+| `OAUTH_CLIENTS_FILE` | No (default `/data/oauth_clients.json`) | Store persistente de clientes OAuth registrados dinámicamente (DCR) |
 | `PORT` | No (default `8080`) | Puerto HTTP |
 
 ## Correr local
