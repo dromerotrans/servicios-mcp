@@ -39,11 +39,24 @@ datos.
 
 ## Autenticación
 
-`Authorization: Bearer <token>` en cada request. Los tokens válidos se
-configuran vía la variable de entorno `MCP_ACCESS_TOKENS`
-(`token1:etiqueta1,token2:etiqueta2,...`) — cada persona tiene su propio
+`Authorization: Bearer <token>` en cada request. Los tokens se gestionan
+desde el panel web `/admin` (ver abajo) — cada persona tiene su propio
 token, independiente de las credenciales reales de SAP/Cisco, así que se
-puede revocar el acceso de una persona sin tocar nada más.
+puede revocar el acceso de una persona sin tocar nada más ni redeployar.
+
+## Panel `/admin` — gestión de tokens
+
+`GET /admin` sirve una página HTML+JS (sin dependencias nuevas) protegida
+con HTTP Basic Auth (`ADMIN_USER`/`ADMIN_PASSWORD`) para generar y revocar
+tokens de acceso en caliente. Los tokens se persisten en
+`TOKENS_FILE` (default `/data/tokens.json`, pensado para montarse sobre un
+PVC) — en el primer arranque sobre un archivo inexistente, se siembran
+automáticamente desde la variable de entorno legacy `MCP_ACCESS_TOKENS`
+(`token1:etiqueta1,token2:etiqueta2,...`), que de ahí en más queda sin
+efecto real. API REST detrás del mismo Basic Auth:
+`GET /admin/api/tokens` (listar), `POST /admin/api/tokens`
+(`{"label": "..."}` → crea y devuelve el token), `DELETE
+/admin/api/tokens/{label}` (revoca).
 
 ## Variables de entorno
 
@@ -61,7 +74,10 @@ puede revocar el acceso de una persona sin tocar nada más.
 | `CCW_CLIENT_SECRET` | Sí (si se usa `ccw_order_status`) | Client Secret OAuth2 Cisco (órdenes) |
 | `CCW_TOKEN_URL` | No (default `https://id.cisco.com/oauth2/default/v1/token`) | Token endpoint CCW |
 | `CCW_API_URL` | No (default `https://capi.cisco.com/commerce/apis`) | Endpoint GraphQL CCW |
-| `MCP_ACCESS_TOKENS` | Sí | Tokens de acceso al MCP, ver arriba |
+| `MCP_ACCESS_TOKENS` | No | Solo usado para sembrar `TOKENS_FILE` en el primer arranque, ver "Panel /admin" |
+| `TOKENS_FILE` | No (default `/data/tokens.json`) | Store persistente de tokens, gestionado desde `/admin` |
+| `ADMIN_USER` | Sí | Usuario del panel `/admin` |
+| `ADMIN_PASSWORD` | Sí | Password del panel `/admin` |
 | `PORT` | No (default `8080`) | Puerto HTTP |
 
 ## Correr local
