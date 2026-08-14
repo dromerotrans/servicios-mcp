@@ -30,6 +30,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
@@ -229,6 +230,9 @@ class CcwrClient:
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
+                # Obligatorio (no documentado en el PDF de Cisco) — un UUID
+                # nuevo por request. Ver deploy/skill-ccwr-contract-admin-2026-08-06.md.
+                "Request-Id": str(uuid.uuid4()),
             },
             method="POST",
         )
