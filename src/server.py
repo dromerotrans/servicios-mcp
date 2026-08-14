@@ -29,6 +29,7 @@ de sesión SAP y el token endpoint OAuth2 de Cisco.
 """
 
 import base64
+import collections
 import contextlib
 import contextvars
 import json
@@ -207,13 +208,81 @@ if not ADMIN_PASSWORD:
 
 MAX_TOP = 1000  # tope duro, evita que un $top gigante tire abajo el server o SAP
 
-# Etiqueta del token (persona) del request en curso, seteada por
-# BearerAuthMiddleware antes de despachar y leída dentro de cada tool para
-# poder loguear "qué token hizo qué" (no solo "qué token pegó qué path" —
-# todas las tools comparten el mismo path /mcp).
+# Etiqueta del token (persona) e IP del request en curso, seteadas por
+# BearerAuthMiddleware antes de despachar y leídas dentro de cada tool para
+# poder loguear/auditar "qué token hizo qué, desde dónde" (no solo "qué
+# token pegó qué path" — todas las tools comparten el mismo path /mcp).
 current_token_label: contextvars.ContextVar[str] = contextvars.ContextVar(
     "current_token_label", default="?"
 )
+current_client_ip: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "current_client_ip", default="?"
+)
+
+# Ruta del registro de auditoría persistente (mismo PVC que TOKENS_FILE).
+# Formato JSON Lines (un evento por línea, append-only) para poder tail-earlo
+# con herramientas normales además de leerlo desde el panel /admin.
+AUDIT_FILE = os.environ.get("AUDIT_FILE", "/data/audit.jsonl")
+AUDIT_MAX_ENTRIES = 1000  # tope en memoria/panel — el archivo en disco no se poda
+
+
+class AuditLog:
+    """Registro de auditoría de solo-agregado: llamadas a tools y fallos de
+    auth. Persiste en JSON Lines y mantiene una cola acotada en memoria para
+    servir al panel /admin sin releer el archivo completo en cada request.
+    """
+
+    def __init__(self, path: str, maxlen: int = AUDIT_MAX_ENTRIES) -> None:
+        self._path = path
+        self._lock = threading.Lock()
+        self._entries: collections.deque = collections.deque(maxlen=maxlen)
+        self._load_tail(maxlen)
+
+    def _load_tail(self, maxlen: int) -> None:
+        if not os.path.exists(self._path):
+            return
+        with open(self._path) as f:
+            lines = f.readlines()[-maxlen:]
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                self._entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    def append(self, **fields) -> None:
+        entry = {"ts": _now_iso(), **fields}
+        with self._lock:
+            self._entries.append(entry)
+            os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
+            with open(self._path, "a") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def list(self, limit: int = 200) -> list[dict]:
+        with self._lock:
+            items = list(self._entries)
+        items.reverse()  # más reciente primero
+        return items[: max(1, min(limit, AUDIT_MAX_ENTRIES))]
+
+
+audit_log = AuditLog(AUDIT_FILE)
+
+
+def _audit_tool_call(tool: str, **params) -> None:
+    """Loguea (stdout, para `oc logs`) Y persiste (para el panel /admin) una
+    llamada a una tool — quién (token/etiqueta), desde dónde (IP), qué tool,
+    con qué parámetros principales."""
+    label = current_token_label.get()
+    ip = current_client_ip.get()
+    log.info("TOOL_CALL tool=%s label=%s ip=%s params=%r", tool, label, ip, params)
+    audit_log.append(event="tool_call", tool=tool, label=label, ip=ip, params=params)
+
+
+def _audit_auth_fail(reason: str, ip: str, path: str) -> None:
+    log.warning("AUTH_FAIL %s ip=%s path=%s", reason, ip, path)
+    audit_log.append(event="auth_fail", reason=reason, ip=ip, path=path)
 
 
 # ---------------------------------------------------------------------------
@@ -514,10 +583,7 @@ def sap_query(
     por llamada — para traer más, paginar con `skip`. Devuelve el JSON crudo de SAP
     (incluye "value": [...] y, si hay más páginas, "odata.nextLink").
     """
-    log.info(
-        "TOOL_CALL tool=sap_query label=%s entity=%s filter=%r top=%s skip=%s",
-        current_token_label.get(), entity, filter, top, skip,
-    )
+    _audit_tool_call("sap_query", entity=entity, filter=filter, top=top, skip=skip)
     try:
         data = sap.query(entity, select, filter, orderby, top, skip)
     except Exception as e:
@@ -533,10 +599,7 @@ def sap_get_entity(entity: str, entry_id: str) -> str:
     con $select, como SerialNumbers dentro de DocumentLines. Ejemplo:
     sap_get_entity("DeliveryNotes", "3134").
     """
-    log.info(
-        "TOOL_CALL tool=sap_get_entity label=%s entity=%s entry_id=%s",
-        current_token_label.get(), entity, entry_id,
-    )
+    _audit_tool_call("sap_get_entity", entity=entity, entry_id=entry_id)
     try:
         data = sap.get_entity(entity, entry_id)
     except Exception as e:
@@ -557,9 +620,11 @@ def ccwr_search(
     listas. Devuelve el JSON crudo de la API de Cisco. Útil para saber si un equipo
     tiene contrato de soporte activo y su vigencia.
     """
-    log.info(
-        "TOOL_CALL tool=ccwr_search label=%s serial_numbers=%s contract_numbers=%s instance_numbers=%s",
-        current_token_label.get(), serial_numbers, contract_numbers, instance_numbers,
+    _audit_tool_call(
+        "ccwr_search",
+        serial_numbers=serial_numbers,
+        contract_numbers=contract_numbers,
+        instance_numbers=instance_numbers,
     )
     if not (serial_numbers or contract_numbers or instance_numbers):
         return json.dumps({"error": "hay que pasar al menos una lista no vacía"})
@@ -588,9 +653,8 @@ def ccw_order_status(
     cuenta no tiene acceso a ESA orden puntual, no que la orden no exista.
     Distinto de ccwr_search: esto es estado de ÓRDENES, no de contratos.
     """
-    log.info(
-        "TOOL_CALL tool=ccw_order_status label=%s order_search_key=%s order_search_value=%s",
-        current_token_label.get(), order_search_key, order_search_value,
+    _audit_tool_call(
+        "ccw_order_status", order_search_key=order_search_key, order_search_value=order_search_value
     )
     try:
         data = ccw.get_order_details(order_search_key, order_search_value, page, page_size)
@@ -616,22 +680,24 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
         auth = request.headers.get("authorization", "")
         if not auth.startswith("Bearer "):
-            log.warning("AUTH_FAIL sin-token ip=%s path=%s", client_ip, path)
+            _audit_auth_fail("sin-token", client_ip, path)
             return JSONResponse({"error": "falta Authorization: Bearer <token>"}, status_code=401)
         token = auth[len("Bearer "):].strip()
         label = token_store.check(token)
         if not label:
-            log.warning("AUTH_FAIL token-invalido ip=%s path=%s", client_ip, path)
+            _audit_auth_fail("token-invalido", client_ip, path)
             return JSONResponse({"error": "token inválido"}, status_code=401)
         request.state.token_label = label
         # Auditoría: quién (etiqueta del token) pega qué endpoint y desde
         # dónde, en cada request autenticado — visible con `oc logs`.
         log.info("AUTH_OK label=%s ip=%s path=%s", label, client_ip, path)
-        token_ctx = current_token_label.set(label)
+        label_ctx = current_token_label.set(label)
+        ip_ctx = current_client_ip.set(client_ip)
         try:
             return await call_next(request)
         finally:
-            current_token_label.reset(token_ctx)
+            current_token_label.reset(label_ctx)
+            current_client_ip.reset(ip_ctx)
 
     @staticmethod
     async def _dispatch_admin(request: Request, call_next, client_ip: str):
@@ -687,6 +753,12 @@ ADMIN_HTML = """<!DOCTYPE html>
   .muted { opacity: 0.65; font-size: 0.85em; }
   .newtoken { background: #2a82; border: 1px solid #2a8; padding: 0.7rem 1rem; border-radius: 8px; margin: 1rem 0; }
   .newtoken code { font-size: 1rem; }
+  h2 { font-size: 1.05rem; margin-top: 2.5rem; }
+  .params { font-size: 0.8em; opacity: 0.8; max-width: 320px; overflow-wrap: anywhere; }
+  .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.75em; }
+  .badge.tool_call { background: #2a83; }
+  .badge.auth_fail { background: #c333; }
+  .toolbar { display: flex; justify-content: space-between; align-items: center; }
 </style>
 </head>
 <body>
@@ -702,6 +774,18 @@ ADMIN_HTML = """<!DOCTYPE html>
 <table id="tbl">
   <thead><tr>
     <th>Etiqueta</th><th>Token</th><th>Creado</th><th>Último uso</th><th>Llamadas</th><th></th>
+  </tr></thead>
+  <tbody></tbody>
+</table>
+
+<div class="toolbar">
+  <h2>Registro de auditoría</h2>
+  <button id="refresh-audit">↻ actualizar</button>
+</div>
+<p class="muted">Últimos eventos: llamadas a tools y autenticaciones fallidas. No se poda solo — el archivo completo queda en el servidor.</p>
+<table id="audit-tbl">
+  <thead><tr>
+    <th>Fecha</th><th>Evento</th><th>Etiqueta / motivo</th><th>Tool</th><th>Parámetros</th><th>IP</th>
   </tr></thead>
   <tbody></tbody>
 </table>
@@ -755,6 +839,27 @@ async function load() {
   });
 }
 
+async function loadAudit() {
+  const items = await api('/admin/api/audit?limit=200');
+  const tbody = document.querySelector('#audit-tbl tbody');
+  tbody.innerHTML = '';
+  for (const e of items) {
+    const tr = document.createElement('tr');
+    const label = e.event === 'tool_call' ? e.label : e.reason;
+    const params = e.params ? JSON.stringify(e.params) : '';
+    tr.innerHTML = `
+      <td>${fmt(e.ts)}</td>
+      <td><span class="badge ${e.event}">${e.event}</span></td>
+      <td>${label ?? ''}</td>
+      <td>${e.tool ?? '—'}</td>
+      <td class="params">${params.length > 200 ? params.slice(0, 200) + '…' : params}</td>
+      <td>${e.ip ?? '—'}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+document.querySelector('#refresh-audit').onclick = loadAudit;
+
 document.querySelector('#add').onclick = async () => {
   const label = document.querySelector('#label').value.trim();
   if (!label) { alert('Poné un nombre/etiqueta primero'); return; }
@@ -774,6 +879,7 @@ document.querySelector('#add').onclick = async () => {
 };
 
 load();
+loadAudit();
 </script>
 </body>
 </html>"""
@@ -809,6 +915,14 @@ async def admin_revoke_token(request: Request) -> Response:
     return Response(status_code=204)
 
 
+async def admin_list_audit(request: Request) -> JSONResponse:
+    try:
+        limit = int(request.query_params.get("limit", "200"))
+    except ValueError:
+        limit = 200
+    return JSONResponse(audit_log.list(limit))
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app: Starlette) -> AsyncIterator[None]:
     async with mcp_server.session_manager.run():
@@ -827,6 +941,7 @@ def build_app() -> Starlette:
             Route("/admin/api/tokens", admin_list_tokens, methods=["GET"]),
             Route("/admin/api/tokens", admin_create_token, methods=["POST"]),
             Route("/admin/api/tokens/{label}", admin_revoke_token, methods=["DELETE"]),
+            Route("/admin/api/audit", admin_list_audit, methods=["GET"]),
             Mount("/", app=mcp_server.streamable_http_app()),
         ],
         middleware=[Middleware(BearerAuthMiddleware)],
