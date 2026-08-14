@@ -22,6 +22,17 @@ Panel /admin: HTML+JS embebido, sin dependencias nuevas, protegido con
 HTTP Basic Auth (ADMIN_USER/ADMIN_PASSWORD) — distinto de los tokens
 Bearer del MCP. Hereda la whitelist de IP y el TLS de la Route.
 
+OAuth2 (para Claude Desktop): además del uso directo del Bearer token
+(Claude Code CLI), el servidor actúa como Authorization Server OAuth 2.1
+(RFC 8414/9728/7591, usando el soporte nativo del SDK `mcp.server.auth`)
+para que el conector se pueda agregar desde el panel de conectores de
+Claude Desktop/Claude.ai, que solo sabe hablar OAuth. Registro dinámico
+de clientes (DCR) habilitado — no hace falta que Diego genere Client
+ID/Secret a mano. El "login" en el navegador (`/oauth/login`) pide el
+mismo token personal que ya usa Claude Code — no es un usuario/password
+nuevo. El access_token que se emite ES ese mismo token personal (revocable
+desde /admin en cualquier momento), no uno nuevo con expiración propia.
+
 Reglas heredadas del skill sap-service-layer de Hermes (no negociables):
 SOLO LECTURA contra SAP. El servidor nunca arma un POST/PATCH/DELETE
 contra una entidad de datos — las únicas llamadas POST son Login/Logout
@@ -47,13 +58,30 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from pydantic import AnyHttpUrl
+
+from mcp.server.auth.provider import (
+    AccessToken as MCPAccessToken,
+    AuthorizationCode as MCPAuthorizationCode,
+    AuthorizationParams,
+    OAuthAuthorizationServerProvider,
+    TokenError,
+    construct_redirect_uri,
+)
+from mcp.server.auth.routes import (
+    build_resource_metadata_url,
+    create_auth_routes,
+    create_protected_resource_routes,
+)
+from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOptions
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.types import ASGIApp
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -91,6 +119,19 @@ CCW_CLIENT_SECRET = os.environ.get("CCW_CLIENT_SECRET", "")
 TOKENS_FILE = os.environ.get("TOKENS_FILE", "/data/tokens.json")
 ADMIN_USER = os.environ.get("ADMIN_USER", "diego")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+
+# OAuth2 (Authorization Server) — para que Claude Desktop pueda agregar el
+# conector desde su panel (solo sabe hablar OAuth, no Bearer token fijo).
+# URL pública canónica del servidor — debe matchear el hostname real de la
+# Route (mismo que transport_security.allowed_hosts más abajo).
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://servicios-mcp.trans.com.ar").rstrip("/")
+OAUTH_CLIENTS_FILE = os.environ.get("OAUTH_CLIENTS_FILE", "/data/oauth_clients.json")
+
+OAUTH_ISSUER_URL = AnyHttpUrl(PUBLIC_BASE_URL)
+OAUTH_RESOURCE_URL = AnyHttpUrl(f"{PUBLIC_BASE_URL}/mcp")
+# URL de metadata (RFC 9728) que el cliente MCP debe consultar tras un 401 —
+# va en el header WWW-Authenticate de cada 401 de /mcp.
+RESOURCE_METADATA_URL = build_resource_metadata_url(OAUTH_RESOURCE_URL)
 
 
 def _now_iso() -> str:
@@ -190,6 +231,44 @@ class TokenStore:
             return len(to_delete)
 
 
+class OAuthClientStore:
+    """Store de clientes OAuth registrados dinámicamente (RFC 7591), persistido
+    como JSON en el mismo PVC que TokenStore. No guarda identidad de personas
+    — solo qué apps (ej. "Claude") se registraron como clientes OAuth; la
+    identidad real de la persona se resuelve en /oauth/login contra
+    TokenStore, igual que con Claude Code.
+    """
+
+    def __init__(self, path: str) -> None:
+        self._path = path
+        self._lock = threading.Lock()
+        self._data: dict[str, dict] = {}
+        self._load()
+
+    def _load(self) -> None:
+        os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
+        if os.path.exists(self._path):
+            with open(self._path) as f:
+                self._data = json.load(f)
+
+    def _save(self) -> None:
+        tmp = f"{self._path}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(self._data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, self._path)
+
+    def get(self, client_id: str) -> dict | None:
+        with self._lock:
+            return self._data.get(client_id)
+
+    def save(self, client_id: str, client_info: dict) -> None:
+        with self._lock:
+            self._data[client_id] = client_info
+            self._save()
+
+
+oauth_client_store = OAuthClientStore(OAUTH_CLIENTS_FILE)
+
 token_store = TokenStore(TOKENS_FILE)
 
 if not token_store.list():
@@ -283,6 +362,168 @@ def _audit_tool_call(tool: str, **params) -> None:
 def _audit_auth_fail(reason: str, ip: str, path: str) -> None:
     log.warning("AUTH_FAIL %s ip=%s path=%s", reason, ip, path)
     audit_log.append(event="auth_fail", reason=reason, ip=ip, path=path)
+
+
+def _audit_oauth_login(label: str, ip: str, client_id: str, client_name: str | None) -> None:
+    log.info("OAUTH_LOGIN_OK label=%s ip=%s client_id=%s client_name=%s", label, ip, client_id, client_name)
+    audit_log.append(event="oauth_login", label=label, ip=ip, client_id=client_id, client_name=client_name)
+
+
+# ---------------------------------------------------------------------------
+# OAuth2 Authorization Server — permite agregar el conector desde Claude
+# Desktop (que solo sabe hablar OAuth, no un Bearer token fijo). Implementa
+# el Protocol OAuthAuthorizationServerProvider del SDK oficial de MCP; las
+# rutas HTTP (/authorize, /token, /register, /.well-known/...) las genera y
+# valida el SDK (PKCE, expiración de código, client_secret, etc. — no hay
+# nada de eso hecho a mano acá). Lo único propio es /oauth/login: un
+# formulario mínimo que pide el MISMO token personal que ya usa Claude Code
+# — no crea una identidad ni una contraseña nueva. El access_token que se
+# termina emitiendo ES ese token personal tal cual (revocable desde /admin
+# en cualquier momento, sin expiración propia adicional).
+# ---------------------------------------------------------------------------
+
+_LOGIN_TTL_SECONDS = 600  # 10 min para completar el formulario de /oauth/login
+_AUTH_CODE_TTL_SECONDS = 300  # 5 min para canjear el code por un token (RFC 6749 10.5)
+
+
+class ServiciosMcpAuthorizationCode(MCPAuthorizationCode):
+    """AuthorizationCode del SDK + los datos que servicios-mcp necesita para
+    resolver el canje: el token personal real y su etiqueta (para loguear)."""
+
+    personal_token: str
+    label: str
+
+
+class ServiciosMcpOAuthProvider:
+    """Implementación mínima de OAuthAuthorizationServerProvider. No hay
+    tercer proveedor de identidad: la persona se autentica pegando su propio
+    token de servicios-mcp en /oauth/login."""
+
+    def __init__(self, client_store: OAuthClientStore) -> None:
+        self._clients = client_store
+        self._lock = threading.Lock()
+        self._pending_logins: dict[str, tuple[OAuthClientInformationFull, AuthorizationParams, float]] = {}
+        self._codes: dict[str, ServiciosMcpAuthorizationCode] = {}
+
+    # -- registro de clientes (RFC 7591) -----------------------------------
+
+    async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        data = self._clients.get(client_id)
+        return OAuthClientInformationFull(**data) if data else None
+
+    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        self._clients.save(client_info.client_id, client_info.model_dump(mode="json", exclude_none=True))
+        log.info(
+            "OAUTH_CLIENT_REGISTERED client_id=%s client_name=%s",
+            client_info.client_id, client_info.client_name,
+        )
+
+    # -- authorize: no hay tercero, redirige a nuestro propio login --------
+
+    def _gc_pending(self) -> None:
+        now = time.time()
+        expired = [k for k, (_, _, exp) in self._pending_logins.items() if exp < now]
+        for k in expired:
+            del self._pending_logins[k]
+
+    async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
+        login_id = secrets.token_urlsafe(24)
+        with self._lock:
+            self._gc_pending()
+            self._pending_logins[login_id] = (client, params, time.time() + _LOGIN_TTL_SECONDS)
+        return f"/oauth/login?login_id={login_id}"
+
+    def peek_pending_login(
+        self, login_id: str
+    ) -> tuple[OAuthClientInformationFull, AuthorizationParams] | None:
+        with self._lock:
+            self._gc_pending()
+            entry = self._pending_logins.get(login_id)
+        if not entry:
+            return None
+        client, params, _ = entry
+        return client, params
+
+    def consume_pending_login(
+        self, login_id: str
+    ) -> tuple[OAuthClientInformationFull, AuthorizationParams] | None:
+        with self._lock:
+            self._gc_pending()
+            entry = self._pending_logins.pop(login_id, None)
+        if not entry:
+            return None
+        client, params, _ = entry
+        return client, params
+
+    def issue_code(self, client: OAuthClientInformationFull, params: AuthorizationParams, personal_token: str, label: str) -> str:
+        code = secrets.token_urlsafe(32)
+        with self._lock:
+            self._codes[code] = ServiciosMcpAuthorizationCode(
+                code=code,
+                scopes=params.scopes or [],
+                expires_at=time.time() + _AUTH_CODE_TTL_SECONDS,
+                client_id=client.client_id,
+                code_challenge=params.code_challenge,
+                redirect_uri=params.redirect_uri,
+                redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
+                resource=params.resource,
+                personal_token=personal_token,
+                label=label,
+            )
+        return code
+
+    # -- intercambio code -> token (PKCE ya validado por el SDK antes de llamar acá) --
+
+    async def load_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: str
+    ) -> ServiciosMcpAuthorizationCode | None:
+        with self._lock:
+            code = self._codes.get(authorization_code)
+        if code is None or code.client_id != client.client_id:
+            return None
+        return code
+
+    async def exchange_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: ServiciosMcpAuthorizationCode
+    ) -> OAuthToken:
+        with self._lock:
+            self._codes.pop(authorization_code.code, None)
+        return OAuthToken(
+            access_token=authorization_code.personal_token,
+            token_type="Bearer",
+            expires_in=None,
+            scope=" ".join(authorization_code.scopes) if authorization_code.scopes else None,
+            refresh_token=None,
+        )
+
+    # -- refresh: no se emiten refresh tokens (el access_token ES el token
+    # personal, de vida larga y revocable desde /admin) -------------------
+
+    async def load_refresh_token(self, client: OAuthClientInformationFull, refresh_token: str):
+        return None
+
+    async def exchange_refresh_token(self, client, refresh_token, scopes) -> OAuthToken:
+        raise TokenError(
+            error="unsupported_grant_type",
+            error_description="servicios-mcp no emite refresh tokens: el access_token no expira "
+            "por sí solo, se revoca desde el panel /admin.",
+        )
+
+    # -- validación de access token (no la usa BearerAuthMiddleware, que
+    # valida directo contra TokenStore; se implementa para cumplir el
+    # Protocol del SDK por completitud) ------------------------------------
+
+    async def load_access_token(self, token: str) -> MCPAccessToken | None:
+        label = token_store.check(token)
+        if not label:
+            return None
+        return MCPAccessToken(token=token, client_id="*", scopes=[], expires_at=None)
+
+    async def revoke_token(self, token) -> None:
+        pass  # la revocación real es desde /admin, sobre TokenStore
+
+
+oauth_provider = ServiciosMcpOAuthProvider(oauth_client_store)
 
 
 # ---------------------------------------------------------------------------
@@ -669,6 +910,13 @@ def ccw_order_status(
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
+    # Rutas del Authorization Server OAuth2 (RFC 8414/9728/7591) y del login
+    # propio de /oauth/login: deben quedar alcanzables SIN un Bearer token
+    # todavía — son justamente el mecanismo para obtenerlo. Siguen detrás de
+    # la whitelist de IP de la Route, no es una superficie nueva a nivel red.
+    _OAUTH_PUBLIC_PATHS = {"/authorize", "/token", "/register"}
+    _OAUTH_PUBLIC_PREFIXES = ("/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource", "/oauth/login")
+
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
         if path in ("/healthz",):
@@ -678,15 +926,21 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if path == "/admin" or path.startswith("/admin/"):
             return await self._dispatch_admin(request, call_next, client_ip)
 
+        if path in self._OAUTH_PUBLIC_PATHS or path.startswith(self._OAUTH_PUBLIC_PREFIXES):
+            return await call_next(request)
+
         auth = request.headers.get("authorization", "")
+        challenge = {"WWW-Authenticate": f'Bearer resource_metadata="{RESOURCE_METADATA_URL}"'}
         if not auth.startswith("Bearer "):
             _audit_auth_fail("sin-token", client_ip, path)
-            return JSONResponse({"error": "falta Authorization: Bearer <token>"}, status_code=401)
+            return JSONResponse(
+                {"error": "falta Authorization: Bearer <token>"}, status_code=401, headers=challenge
+            )
         token = auth[len("Bearer "):].strip()
         label = token_store.check(token)
         if not label:
             _audit_auth_fail("token-invalido", client_ip, path)
-            return JSONResponse({"error": "token inválido"}, status_code=401)
+            return JSONResponse({"error": "token inválido"}, status_code=401, headers=challenge)
         request.state.token_label = label
         # Auditoría: quién (etiqueta del token) pega qué endpoint y desde
         # dónde, en cada request autenticado — visible con `oc logs`.
@@ -758,6 +1012,7 @@ ADMIN_HTML = """<!DOCTYPE html>
   .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.75em; }
   .badge.tool_call { background: #2a83; }
   .badge.auth_fail { background: #c333; }
+  .badge.oauth_login { background: #a3a3; }
   .toolbar { display: flex; justify-content: space-between; align-items: center; }
 </style>
 </head>
@@ -845,13 +1100,13 @@ async function loadAudit() {
   tbody.innerHTML = '';
   for (const e of items) {
     const tr = document.createElement('tr');
-    const label = e.event === 'tool_call' ? e.label : e.reason;
+    const label = e.event === 'auth_fail' ? e.reason : e.label;
     const params = e.params ? JSON.stringify(e.params) : '';
     tr.innerHTML = `
       <td>${fmt(e.ts)}</td>
       <td><span class="badge ${e.event}">${e.event}</span></td>
       <td>${label ?? ''}</td>
-      <td>${e.tool ?? '—'}</td>
+      <td>${e.tool ?? e.client_name ?? '—'}</td>
       <td class="params">${params.length > 200 ? params.slice(0, 200) + '…' : params}</td>
       <td>${e.ip ?? '—'}</td>
     `;
@@ -923,6 +1178,96 @@ async def admin_list_audit(request: Request) -> JSONResponse:
     return JSONResponse(audit_log.list(limit))
 
 
+# ---------------------------------------------------------------------------
+# /oauth/login — paso de "consentimiento" del flujo OAuth2. No crea usuarios
+# ni contraseñas nuevas: pide el mismo token personal de servicios-mcp que
+# ya usa Claude Code, lo valida contra TokenStore, y si es válido emite el
+# authorization code que el SDK necesita para completar el intercambio.
+# ---------------------------------------------------------------------------
+
+_OAUTH_LOGIN_HTML = """<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>servicios-mcp — autorizar</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{ font-family: -apple-system, system-ui, sans-serif; max-width: 420px;
+         margin: 3rem auto; padding: 0 1rem; line-height: 1.5; }}
+  h1 {{ font-size: 1.15rem; }}
+  p.muted {{ opacity: 0.7; font-size: 0.9em; }}
+  input[type=password] {{ width: 100%; padding: 0.6rem 0.7rem; border-radius: 6px;
+         border: 1px solid #8886; box-sizing: border-box; font-size: 1rem; margin: 0.5rem 0 1rem; }}
+  button {{ width: 100%; padding: 0.6rem; border-radius: 6px; border: none;
+         background: #2a6df4; color: white; font-size: 1rem; cursor: pointer; }}
+  .err {{ color: #c33; font-size: 0.9em; }}
+</style>
+</head>
+<body>
+<h1>Autorizar {client_name} en servicios-mcp</h1>
+<p class="muted">Pegá tu token de acceso personal de servicios-mcp (el mismo que usás
+con Claude Code) para conectar {client_name}. Esto NO crea una cuenta nueva —
+solo confirma quién sos.</p>
+{error}
+<form method="post" action="/oauth/login">
+  <input type="hidden" name="login_id" value="{login_id}">
+  <input type="password" name="token" placeholder="tok_..." autofocus required>
+  <button type="submit">Autorizar</button>
+</form>
+</body>
+</html>"""
+
+
+def _render_oauth_login(login_id: str, client_name: str, error: str = "") -> HTMLResponse:
+    error_html = f'<p class="err">{error}</p>' if error else ""
+    html = _OAUTH_LOGIN_HTML.format(
+        client_name=client_name or "esta app", login_id=login_id, error=error_html
+    )
+    return HTMLResponse(html, status_code=401 if error else 200)
+
+
+async def oauth_login_get(request: Request) -> Response:
+    login_id = request.query_params.get("login_id", "")
+    pending = oauth_provider.peek_pending_login(login_id)
+    if not pending:
+        return HTMLResponse(
+            "<h1>Enlace inválido o vencido</h1><p>Volvé a intentar agregar el conector desde Claude.</p>",
+            status_code=400,
+        )
+    client, _params = pending
+    return _render_oauth_login(login_id, client.client_name or client.client_id)
+
+
+async def oauth_login_post(request: Request) -> Response:
+    form = await request.form()
+    login_id = str(form.get("login_id", ""))
+    token = str(form.get("token", "")).strip()
+    client_ip = request.client.host if request.client else "?"
+
+    pending = oauth_provider.peek_pending_login(login_id)
+    if not pending:
+        return HTMLResponse(
+            "<h1>Enlace inválido o vencido</h1><p>Volvé a intentar agregar el conector desde Claude.</p>",
+            status_code=400,
+        )
+    client, params = pending
+
+    label = token_store.check(token) if token else None
+    if not label:
+        _audit_auth_fail("oauth-token-invalido", client_ip, "/oauth/login")
+        return _render_oauth_login(
+            login_id, client.client_name or client.client_id, error="Token inválido — probá de nuevo."
+        )
+
+    oauth_provider.consume_pending_login(login_id)
+    code = oauth_provider.issue_code(client, params, personal_token=token, label=label)
+    _audit_oauth_login(label, client_ip, client.client_id, client.client_name)
+
+    redirect_url = construct_redirect_uri(str(params.redirect_uri), code=code, state=params.state)
+    return RedirectResponse(redirect_url, status_code=302, headers={"Cache-Control": "no-store"})
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app: Starlette) -> AsyncIterator[None]:
     async with mcp_server.session_manager.run():
@@ -934,6 +1279,22 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
 def build_app() -> Starlette:
     from starlette.routing import Mount, Route
 
+    # Rutas del Authorization Server OAuth2 — generadas y validadas por el
+    # SDK oficial de MCP (PKCE, expiración de código, auth de client_secret,
+    # metadata RFC 8414/9728, DCR RFC 7591). Ver ServiciosMcpOAuthProvider
+    # más arriba para la única parte propia (el login).
+    oauth_routes = create_auth_routes(
+        provider=oauth_provider,
+        issuer_url=OAUTH_ISSUER_URL,
+        client_registration_options=ClientRegistrationOptions(enabled=True),
+        revocation_options=RevocationOptions(enabled=False),
+    )
+    protected_resource_routes = create_protected_resource_routes(
+        resource_url=OAUTH_RESOURCE_URL,
+        authorization_servers=[OAUTH_ISSUER_URL],
+        resource_name="servicios-mcp",
+    )
+
     app = Starlette(
         routes=[
             Route("/healthz", healthz),
@@ -942,6 +1303,10 @@ def build_app() -> Starlette:
             Route("/admin/api/tokens", admin_create_token, methods=["POST"]),
             Route("/admin/api/tokens/{label}", admin_revoke_token, methods=["DELETE"]),
             Route("/admin/api/audit", admin_list_audit, methods=["GET"]),
+            Route("/oauth/login", oauth_login_get, methods=["GET"]),
+            Route("/oauth/login", oauth_login_post, methods=["POST"]),
+            *oauth_routes,
+            *protected_resource_routes,
             Mount("/", app=mcp_server.streamable_http_app()),
         ],
         middleware=[Middleware(BearerAuthMiddleware)],
